@@ -1,0 +1,77 @@
+import sys
+import numpy as np
+
+
+sys.path.extend(['../'])
+from .rotation import *
+from tqdm import tqdm
+
+
+def pre_normalization(data, assume_pelvis_relative=True):
+    N, C, T, V, M = data.shape
+    s = np.transpose(data, [0, 4, 2, 3, 1])  # N, C, T, V, M  to  N, M, T, V, C
+
+    print('pad the null frames with the previous frames')
+    L_HIP, R_HIP = 11, 12
+    L_SH, R_SH   = 5, 6
+    target_z = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    target_x = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    for i_s, skeleton in enumerate(tqdm(s, desc='align axes')):  # skeleton: (M,T,V,C)
+        if skeleton.sum() == 0:
+            continue
+
+        pel0 = 0.5 * (skeleton[0, 0, L_HIP, :] + skeleton[0, 0, R_HIP, :])
+        shm0 = 0.5 * (skeleton[0, 0, L_SH,  :] + skeleton[0, 0, R_SH,  :])
+        v_z  = shm0 - pel0
+        nz = np.linalg.norm(v_z) + 1e-8
+        v_z = v_z / nz
+
+        axis_z  = np.cross(v_z, target_z)
+        ang_z   = angle_between(v_z, target_z)
+        if np.linalg.norm(axis_z) > 1e-8 and np.isfinite(ang_z):
+            Rz = rotation_matrix(axis_z, ang_z)
+        else:
+            Rz = np.eye(3, dtype=np.float32)
+
+
+        for i_p in range(skeleton.shape[0]):
+            if skeleton[i_p].sum() == 0:
+                continue
+            for i_f in range(skeleton.shape[1]):
+                if skeleton[i_p, i_f].sum() == 0:
+                    continue
+                skeleton[i_p, i_f] = np.dot(skeleton[i_p, i_f], Rz.T)
+
+
+        rsh0 = skeleton[0, 0, R_SH, :]
+        lsh0 = skeleton[0, 0, L_SH, :]
+        v_x  = lsh0 - rsh0
+        nx = np.linalg.norm(v_x) + 1e-8
+        v_x = v_x / nx
+
+        axis_x = np.cross(v_x, target_x)
+        ang_x  = angle_between(v_x, target_x)
+        if np.linalg.norm(axis_x) > 1e-8 and np.isfinite(ang_x):
+            Rx = rotation_matrix(axis_x, ang_x)
+        else:
+            Rx = np.eye(3, dtype=np.float32)
+
+        for i_p in range(skeleton.shape[0]):
+            if skeleton[i_p].sum() == 0:
+                continue
+            for i_f in range(skeleton.shape[1]):
+                if skeleton[i_p, i_f].sum() == 0:
+                    continue
+                skeleton[i_p, i_f] = np.dot(skeleton[i_p, i_f], Rx.T)
+
+        s[i_s] = skeleton 
+
+    # (N,M,T,V,C) -> (N,C,T,V,M)
+    return np.transpose(s, [0, 4, 2, 3, 1])
+
+
+if __name__ == '__main__':
+    data = np.load('../data/rgbd/val_data.npy')
+    pre_normalization(data)
+    np.save('../data/rgbd/data_val_pre.npy', data)

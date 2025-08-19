@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RGB-D skeleton txt(.skeleton) → Shift-GCN 입력용 joint npy/pkl 변환기 (새 규칙 전용)
+
+- 파일명 규칙: 001A002.skeleton  (앞 3자리=액션번호, 뒤 3자리=순번)
+  * 액션 라벨: (액션번호 - 1)로 0-index 변환
+  * 규칙에 맞지 않는 파일은 전부 스킵(옛 형식 미지원)
+
+- 데이터 형태: (N, 3, T, V, M) with M=1 (한 사람만)
+- 프레임 길이 보정: target T=max_frame
+    * 길면 잘라냄, 짧으면 마지막 프레임 반복으로 패딩
+- 출력:
+    * {out_folder}/train_label.pkl, val_label.pkl  (names, labels)
+    * {out_folder}/train_data_joint.npy, val_data_joint.npy
+
+주의:
+- config의 model_args.num_person 은 반드시 1 이어야 함.
+- stratify split을 쓰므로 각 클래스가 최소 2개 이상 있어야 합니다.
+"""
+
+import argparse
+import os
+import re
+import pickle
+from pathlib import Path
+from tqdm import tqdm
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+# ---- 프로젝트 경로 & 전처리 불러오기 ----
+BASE_DIR = Path(__file__).resolve().parent
+import sys
+sys.path.extend(['../'])
+from .preprocess import pre_normalization  # (N, 3, T, V, M) -> normalized array
+
+# ---- 하이퍼파라미터(필요하면 argparse로 바꿔도 됨) ----
+max_body_true = 1       # 저장/학습에 사용할 사람 수 M
+max_body_kinect = 1     # 입력 파일에서 읽을 최대 사람 수 (여기선 1로 고정)
+num_joint = 17          # V
+max_frame = 32          # T (부족하면 패딩, 초과면 자름)
+
+# 새 규칙 전용: 001A002.skeleton -> action=001, order=002
+NEW_STYLE = re.compile(r'(?P<action>\d{3})A(?P<order>\d{3})', re.IGNORECASE)
+
+def parse_action_from_filename(fn: str):
+    """
+    새 규칙(001A002.skeleton)에서만 액션번호 추출 (0-index).
+    규칙에 맞지 않으면 None 반환.
+    """
+    m = NEW_STYLE.search(fn)
+    if m:
+        return int(m.group('action')) - 1
+    return None
+
+def make_file_split(data_path, train_ratio, seed):
+    """폴더에서 새 규칙 파일만 모아 stratified split."""
+    all_files, all_labels = [], []
+
+    for fn in os.listdir(data_path):
+        if not fn.lower().endswith('.skeleton'):
+            continue
+        action_class = parse_action_from_filename(fn)
+        if action_class is None:
+            # 옛 형식/잘못된 이름은 모두 무시
+            continue
+        all_files.append(fn)
+        all_labels.append(action_class)
+
+    if len(all_files) == 0:
+        raise RuntimeError("유효한 .skeleton 파일이 없습니다. (001A002.skeleton 형식만 지원)")
+
+    # stratify split (클래스당 샘플 수가 2개 미만이면 에러날 수 있음)
+    train_files, val_files, train_labels, val_labels = train_test_split(
+        all_files,
+        all_labels,
+        train_size=train_ratio,
+        random_state=seed,
+        stratify=all_labels
+    )
+
+    # (파일명, 라벨) 쌍으로 반환
+    train_files = list(zip(train_files, train_labels))
+    val_files = list(zip(val_files, val_labels))
+    return train_files, val_files
+
+def read_skeleton_filter(file_path: str):
+    """
+    텍스트(.skeleton) 포맷 읽기
+    포맷:
+        numFrame
+        numBody
+          bodyID
+          numJoint
+            x y z (joint 0)
+            ...
+    """
+    with open(file_path, 'r') as f:
+        skeleton_sequence = {'frameInfo': []}
+        skeleton_sequence['numFrame'] = int(f.readline())
+        for _ in range(skeleton_sequence['numFrame']):
+            frame_info = {'bodyInfo': []}
+            frame_info['numBody'] = int(f.readline())
+
+            for _m in range(frame_info['numBody']):
+                # bodyID 한 줄
+                body_id = float(f.readline().split()[0])  # 실제로는 int 가능
+                num_joint_this = int(f.readline())
+                joints = []
+                for _v in range(num_joint_this):
+                    x, y, z = map(float, f.readline().split())
+                    joints.append({'x': x, 'y': y, 'z': z})
+                frame_info['bodyInfo'].append({
+                    'bodyID': body_id,
+                    'numJoint': num_joint_this,
+                    'jointInfo': joints
+                })
+            skeleton_sequence['frameInfo'].append(frame_info)
+    return skeleton_sequence
+
+def get_nonzero_std(s):
+    """(T, V, C)에서 유효 프레임만 골라 좌표 표준편차 합. (여기선 M=1이라 참고용)"""
+    # s: (T, V, C)
+    index = s.sum(-1).sum(-1) != 0  # 유효 프레임
+    s = s[index]
+    if len(s) != 0:
+        s = s[:, :, 0].std() + s[:, :, 1].std() + s[:, :, 2].std()
+    else:
+        s = 0.0
+    return s
+
+def read_xyz(file_path, max_body=1, num_joint=17):
+    """
+    .skeleton → (3, T, V, M)
+    여기선 max_body=1, max_body_true=1로 고정 동작. (한 사람만)
+    """
+    seq = read_skeleton_filter(file_path)
+    T = seq['numFrame']
+    data = np.zeros((max_body, T, num_joint, 3), dtype=np.float32)  # (M, T, V, C)
+
+    for n, fr in enumerate(seq['frameInfo']):
+        for m, b in enumerate(fr['bodyInfo']):
+            if m >= max_body:
+                break
+            for j, v in enumerate(b['jointInfo']):
+                if j >= num_joint:
+                    break
+                data[m, n, j, 0] = v['x']
+                data[m, n, j, 1] = v['y']
+                data[m, n, j, 2] = v['z']
+
+    # (참고) 여러 명일 때 상위 에너지 선택 로직. 현재 max_body_true=1이라 첫 사람만 사용.
+    # energy = np.array([get_nonzero_std(data[k]) for k in range(max_body)], dtype=np.float32)
+    # idx = energy.argsort()[::-1][:max_body_true]
+    # data = data[idx]
+
+    # (M, T, V, C) -> (C, T, V, M)
+    data = data.transpose(3, 1, 2, 0)
+    return data  # (3, T, V, M)
+
+def fit_length(x: np.ndarray, target_T: int):
+    """
+    x: (3, T, V, M)
+    - T > target_T: 앞에서 자름
+    - T < target_T: 마지막 프레임 반복 패딩
+    """
+    C, T, V, M = x.shape
+    if T == target_T:
+        return x
+    if T > target_T:
+        return x[:, :target_T, :, :]
+    # pad
+    pad = np.repeat(x[:, -1:, :, :], target_T - T, axis=1)
+    return np.concatenate([x, pad], axis=1)
+
+def gendata(data_path, out_path, part, train_files=None, val_files=None):
+    assert part in ('train', 'val')
+
+    # 어떤 리스트를 쓸지 결정 (None 허용)
+    if part == 'train':
+        files_in_part = train_files or []
+    else:
+        files_in_part = val_files or []
+
+    # 파일 목록/라벨 수집
+    sample_name, sample_label = [], []
+    for filename, label in sorted(files_in_part, key=lambda x: x[0]):
+        if not filename.lower().endswith('.skeleton'):
+            continue
+        fullpath = os.path.join(data_path, filename)
+        if not os.path.isfile(fullpath):
+            continue
+        sample_name.append(filename)
+        sample_label.append(int(label))
+
+    # 라벨 저장 (빈 리스트여도 저장)
+    os.makedirs(out_path, exist_ok=True)
+    with open(f'{out_path}/{part}_label.pkl', 'wb') as f:
+        pickle.dump((sample_name, sample_label), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # 샘플이 없으면 빈 배열 저장하고 종료
+    N = len(sample_label)
+    if N == 0:
+        fp = np.zeros((0, 3, max_frame, num_joint, max_body_true), dtype=np.float32)
+        np.save(f'{out_path}/{part}_data_joint.npy', fp)
+        return
+
+    # 데이터 텐서 준비: (N, 3, T, V, M)
+    fp = np.zeros((N, 3, max_frame, num_joint, max_body_true), dtype=np.float32)
+
+    # 빌드
+    skipped = 0
+    for i, s in enumerate(tqdm(sample_name, desc=f'Build {part}')):
+        full = os.path.join(data_path, s)
+        try:
+            data = read_xyz(full, max_body=max_body_kinect, num_joint=num_joint)  # (3,T,V,M)
+            data = fit_length(data, max_frame)  # (3, max_frame, V, M)
+            fp[i] = data
+        except Exception:
+            skipped += 1
+            # 실패 시 해당 인덱스는 0으로 남김 (필요하면 continue로 두고 라벨/이름도 제거하도록 로직 확장 가능)
+            continue
+
+    # 전처리(정규화 등)
+    fp = pre_normalization(fp)
+    np.save(f'{out_path}/{part}_data_joint.npy', fp)
+
+    if skipped:
+        print(f"[warn] {part}: {skipped} file(s) failed to parse and were zero-padded.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='RGB-D joint data builder (new filename rule only).')
+    parser.add_argument('--data_path', default=str((BASE_DIR / '../data/rgbd_raw').resolve()))
+    parser.add_argument('--out_folder', default=str((BASE_DIR / '../data/rgbd').resolve()))
+    parser.add_argument('--train_ratio', type=float, default=0.8)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--part', choices=['train', 'val', 'both'], default='both',
+                        help="'train'만, 'val'만, 또는(default=both) 둘 다 생성")
+    args = parser.parse_args()
+
+    os.makedirs(args.out_folder, exist_ok=True)
+
+    if args.part == 'val':
+        # 폴더 전체를 val로 처리
+        all_files = []
+        all_labels = []
+        for fn in os.listdir(args.data_path):
+            if not fn.lower().endswith('.skeleton'):
+                continue
+            action_class = parse_action_from_filename(fn)
+            if action_class is None:
+                continue
+            all_files.append(fn)
+            all_labels.append(action_class)
+
+        val_files = list(zip(all_files, all_labels))
+        print(f"Total files treated as VAL: {len(val_files)}")
+        gendata(args.data_path, args.out_folder, 'val', None, val_files)
+
+    else:
+        # 기존 split 방식
+        train_files, val_files = make_file_split(args.data_path, args.train_ratio, args.seed)
+        print(f"Total valid files (new style only): train={len(train_files)}, val={len(val_files)}")
+
+        if args.part in ['train', 'both']:
+            print('train')
+            gendata(args.data_path, args.out_folder, 'train', train_files, val_files)
+        if args.part in ['both']:
+            print('val')
+            gendata(args.data_path, args.out_folder, 'val', train_files, val_files)
+
+if __name__ == '__main__':
+    main()

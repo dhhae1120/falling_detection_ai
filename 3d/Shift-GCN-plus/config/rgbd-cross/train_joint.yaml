@@ -1,0 +1,43 @@
+# ./config/rgbd-cross/train_joint.yaml
+
+Experiment_name: rgbd_ShiftGCNplus_joint
+
+# feeder
+feeder: feeders.feeder.Feeder
+train_feeder_args:
+  data_path: ./data/rgbd/train_data_joint.npy
+  label_path: ./data/rgbd/train_label.pkl
+  debug: false
+  random_choose: false
+  random_shift: false
+  random_move: false
+  window_size: -1
+  normalization: false
+
+test_feeder_args:
+  data_path: ./data/rgbd/val_data_joint.npy
+  label_path: ./data/rgbd/val_label.pkl
+
+# model
+model: model.shiftgcn_plus.Model
+model_args:
+  num_class: 4
+  num_point: 17
+  num_person: 1
+  graph: graph.custom17.Graph
+  graph_args:
+    labeling_mode: spatial
+  distill_weight: 0.0
+
+# optim
+weight_decay: 0.0001
+base_lr: 0.1
+step: [25, 40]   
+
+# training
+device: [0]
+only_train_epoch: 1
+batch_size: 16
+test_batch_size: 64
+num_epoch: 50
+nesterov: true
